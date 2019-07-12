@@ -1,0 +1,537 @@
+diff --git include/arch/riscv/arch/kernel/boot.h include/arch/riscv/arch/kernel/boot.h
+index 053c1f3f..f597664e 100644
+--- include/arch/riscv/arch/kernel/boot.h
++++ include/arch/riscv/arch/kernel/boot.h
+@@ -25,12 +25,14 @@ cap_t create_unmapped_it_frame_cap(pptr_t pptr, bool_t use_large);
+ cap_t create_mapped_it_frame_cap(cap_t pd_cap, pptr_t pptr, vptr_t vptr, asid_t asid, bool_t use_large, bool_t executable);
+ 
+ void init_kernel(
+-    paddr_t ui_p_reg_start,
+-    paddr_t ui_p_reg_end,
+-    sword_t pv_offset,
+-    vptr_t  v_entry,
+-    word_t hartid,
+-    paddr_t dtb_output
++    uint64_t dummy,
++    paddr_t keystone_dram_base,
++    uint64_t keystone_dram_size,
++    paddr_t keystone_runtime_start,
++    paddr_t keystone_user_start,
++    paddr_t keystone_free_start,
++    vptr_t keystone_utm_ptr,
++    uint64_t keystone_utm_size
+ );
+ 
+ #endif
+diff --git include/arch/riscv/arch/kernel/vspace.h include/arch/riscv/arch/kernel/vspace.h
+index 7a59b075..6393ca33 100644
+--- include/arch/riscv/arch/kernel/vspace.h
++++ include/arch/riscv/arch/kernel/vspace.h
+@@ -26,6 +26,7 @@
+ cap_t create_it_address_space(cap_t root_cnode_cap, v_region_t it_v_reg);
+ void map_it_pt_cap(cap_t vspace_cap, cap_t pt_cap);
+ void map_it_frame_cap(cap_t vspace_cap, cap_t frame_cap);
++void keystone_map_kernel_window(word_t start, word_t end);
+ void map_kernel_window(void);
+ void map_kernel_frame(paddr_t paddr, pptr_t vaddr, vm_rights_t vm_rights);
+ void activate_kernel_vspace(void);
+diff --git include/arch/riscv/arch/model/statedata.h include/arch/riscv/arch/model/statedata.h
+index 5559b276..c6cecfac 100644
+--- include/arch/riscv/arch/model/statedata.h
++++ include/arch/riscv/arch/model/statedata.h
+@@ -39,11 +39,13 @@ extern asid_pool_t *riscvKSASIDTable[BIT(asidHighBits)];
+ 
+ /* Kernel Page Tables */
+ extern pte_t kernel_root_pageTable[BIT(PT_INDEX_BITS)] VISIBLE;
++extern pte_t kernel_root_level2_pageTable[BIT(PT_INDEX_BITS)] VISIBLE;
+ 
+ /* If our PADDR_LOAD is not 1GiB aligned then we need to introduce a level2 pagetable
+  * in order to map in our kernel image at KERNEL_BASE */
+-#if CONFIG_PT_LEVELS == 3 && !IS_ALIGNED(PADDR_LOAD, RISCV_GET_LVL_PGSIZE_BITS(1))
++//#if CONFIG_PT_LEVELS == 3 && !IS_ALIGNED(PADDR_LOAD, RISCV_GET_LVL_PGSIZE_BITS(1))
+ #define RISCV_KERNEL_WINDOW_LEVEL2_PT
+ extern pte_t kernel_image_level2_pt[BIT(PT_INDEX_BITS)];
+-#endif
++extern pte_t kernel_image_level3_pt[BIT(PT_INDEX_BITS)];
++//#endif
+ #endif
+diff --git include/arch/riscv/arch/sbi.h include/arch/riscv/arch/sbi.h
+index dd828f1f..fa8298b8 100644
+--- include/arch/riscv/arch/sbi.h
++++ include/arch/riscv/arch/sbi.h
+@@ -83,12 +83,6 @@ static inline void sbi_set_timer(unsigned long long stime_value)
+     SBI_CALL_1(SBI_SET_TIMER, stime_value);
+ #endif
+ }
+-
+-static inline void sbi_shutdown(void)
+-{
+-    SBI_CALL_0(SBI_SHUTDOWN);
+-}
+-
+ static inline void sbi_clear_ipi(void)
+ {
+     SBI_CALL_0(SBI_CLEAR_IPI);
+@@ -119,4 +113,24 @@ static inline void sbi_remote_sfence_vma_asid(const unsigned long *hart_mask,
+     SBI_CALL_1(SBI_REMOTE_SFENCE_VMA_ASID, (register_t)hart_mask);
+ }
+ 
++#define SBI_SM_CREATE_ENCLAVE   101
++#define SBI_SM_DESTROY_ENCLAVE  102
++#define SBI_SM_ATTEST_ENCLAVE   103
++#define SBI_SM_RUN_ENCLAVE      105
++#define SBI_SM_STOP_ENCLAVE     106
++#define SBI_SM_RESUME_ENCLAVE   107
++#define SBI_SM_EXIT_ENCLAVE     1101
++#define SBI_SM_NOT_IMPLEMENTED  1111
++
++static inline void sbi_stop_enclave(uint64_t request) {
++  SBI_CALL_1(SBI_SM_STOP_ENCLAVE, request);
++}
++
++static inline void sbi_shutdown(void)
++{
++//    // Keystone Enclave Exit
++      SBI_CALL_1(SBI_SM_EXIT_ENCLAVE, 0);
++}
++
++
+ #endif
+diff --git include/plat/spike/plat/machine/fdt.h include/plat/spike/plat/machine/fdt.h
+index 49972d31..9c52b510 100644
+--- include/plat/spike/plat/machine/fdt.h
++++ include/plat/spike/plat/machine/fdt.h
+@@ -29,6 +29,7 @@
+ #ifndef FDT_H
+ #define FDT_H
+ 
++void keystoneFDT(uint64_t memstart, uint64_t memsize);
+ void parseFDT(void *fdt);
+ uint32_t fdt_size(void *fdt);
+ 
+diff --git include/plat/spike/plat/machine/hardware.h include/plat/spike/plat/machine/hardware.h
+index 5f59ae32..c8df182d 100644
+--- include/plat/spike/plat/machine/hardware.h
++++ include/plat/spike/plat/machine/hardware.h
+@@ -22,24 +22,39 @@
+ #include <config.h>
+ #include <plat_mode/machine/hardware.h>
+ 
+-#if __riscv_xlen == 32
++//#if __riscv_xlen == 32
++
+ /* Contain the typical location of memory */
+-#define PADDR_BASE 0x80000000lu
+-#else
++//#define PADDR_BASE 0x80000000lu
++//#else
+ /* The main kernel window will start at the 0 physical address so that it can contain
+  * any potential memory that may exist */
+-#define PADDR_BASE 0x0lu
+-#endif
++//#define PADDR_BASE 0x0lu
++//#endif
++
++extern word_t keystone_paddr_base;
++inline word_t paddr_base(void)
++{
++  return keystone_paddr_base;
++}
++#define PADDR_BASE paddr_base()
+ 
+-#ifdef CONFIG_BUILD_ROCKET_CHIP_ZEDBOARD
++//#ifdef CONFIG_BUILD_ROCKET_CHIP_ZEDBOARD
+ /* The Rocket-Chip for zedboard only has 256MiB of Memory. */
+-#define PADDR_LOAD 0x88000000lu
+-#else
++//#define PADDR_LOAD 0x88000000lu
++//#else
+ /* This represents the physical address that the kernel image will be linked to. This needs to
+  * be on a 1gb boundary as we currently require being able to creating a mapping to this address
+  * as the largest frame size */
+-#define PADDR_LOAD 0xC0000000lu
+-#endif
++//#define PADDR_LOAD 0xC0000000lu
++//#endif
++
++extern word_t keystone_paddr_load;
++inline word_t paddr_load(void)
++{
++  return keystone_paddr_load;
++}
++#define PADDR_LOAD paddr_load()
+ 
+ /* The highest valid physical address that can be indexed in the kernel window */
+ #define PADDR_TOP (KERNEL_BASE - PPTR_BASE + PADDR_BASE)
+diff --git src/arch/riscv/head.S src/arch/riscv/head.S
+index 5d7f4977..39841030 100644
+--- src/arch/riscv/head.S
++++ src/arch/riscv/head.S
+@@ -36,11 +36,11 @@ _start:
+ 
+   /* hartid is in a4 */
+   li  sp, BIT(CONFIG_KERNEL_STACK_BITS)
+-  mul sp, sp, a4
++  mul sp, sp, x0
+   la  x1, (kernel_stack_alloc + (BIT(CONFIG_KERNEL_STACK_BITS)))
+   add sp, sp, x1
+ 
+-  csrrw x0, sscratch, a4 /* zero sscratch for the init task */
++  csrrw x0, sscratch, x0 //a4 /* zero sscratch for the init task */
+ 
+   /* la sp, (kernel_stack_alloc + BIT(CONFIG_KERNEL_STACK_BITS)) */
+   jal init_kernel
+diff --git src/arch/riscv/kernel/boot.c src/arch/riscv/kernel/boot.c
+index f00c4b66..8449e884 100644
+--- src/arch/riscv/kernel/boot.c
++++ src/arch/riscv/kernel/boot.c
+@@ -30,6 +30,10 @@
+ #include <plat/machine/fdt.h>
+ #include <machine.h>
+ 
++/* Keystone Physical Addresses */
++word_t keystone_paddr_base;
++word_t keystone_paddr_load;
++
+ /* pointer to the end of boot code/data in kernel image */
+ /* need a fake array to get the pointer from the linker script */
+ extern char ki_boot_end[1];
+@@ -147,7 +151,7 @@ init_freemem(region_t ui_reg, region_t dtb_reg)
+             .end = ui_reg.end
+         }
+     };
+-
++    return;
+     for (i = 0; i < MAX_NUM_FREEMEM_REG; i++) {
+         ndks_boot.freemem[i] = REG_EMPTY;
+     }
+@@ -213,9 +217,10 @@ init_cpu(void)
+ /* This and only this function initialises the platform. It does NOT initialise any kernel state. */
+ 
+ BOOT_CODE static void
+-init_plat(region_t dtb)
++init_plat(paddr_t memstart, uint64_t memsize)
+ {
+-    parseFDT((void*)dtb.start);
++    keystoneFDT(memstart, memsize);
++    //parseFDT((void*)dtb.start);
+     initIRQController();
+     initTimer();
+ }
+@@ -224,18 +229,37 @@ init_plat(region_t dtb)
+ 
+ static BOOT_CODE bool_t
+ try_init_kernel(
+-    paddr_t ui_p_reg_start,
+-    paddr_t ui_p_reg_end,
+-    paddr_t dtb_p_reg_start,
+-    paddr_t dtb_p_reg_end,
+-    uint32_t pv_offset,
+-    vptr_t  v_entry
++    uint64_t dummy,
++    paddr_t keystone_dram_base,
++    uint64_t keystone_dram_size,
++    paddr_t keystone_runtime_start,
++    paddr_t keystone_user_start,
++    paddr_t keystone_free_start,
++    vptr_t  keystone_utm_ptr,
++    uint64_t  keystone_utm_size
+ )
+ {
++    (void) dummy;
+     cap_t root_cnode_cap;
+     cap_t it_pd_cap;
+     cap_t it_ap_cap;
+     cap_t ipcbuf_cap;
++
++    /* SeL4 Parameters */
++    paddr_t ui_p_reg_start;
++    paddr_t ui_p_reg_end;
++    uint32_t pv_offset;
++    vptr_t v_entry;
++    /* Keystone Parameters */
++    v_entry = read_sepc();
++    ui_p_reg_start = keystone_user_start;
++    ui_p_reg_end = keystone_free_start;
++
++    pv_offset = keystone_user_start - 0x10000;
++
++    keystone_paddr_base = keystone_dram_base;
++    keystone_paddr_load = keystone_runtime_start;
++
+     p_region_t boot_mem_reuse_p_reg = ((p_region_t) {
+         kpptr_to_paddr((void*)KERNEL_BASE), kpptr_to_paddr(ki_boot_end)
+     });
+@@ -244,7 +268,7 @@ try_init_kernel(
+         ui_p_reg_start, ui_p_reg_end
+     });
+     region_t dtb_reg = paddr_to_pptr_reg((p_region_t) {
+-        dtb_p_reg_start, dtb_p_reg_end
++        0, 0
+     });
+     pptr_t bi_frame_pptr;
+     vptr_t bi_frame_vptr;
+@@ -264,16 +288,28 @@ try_init_kernel(
+     it_v_reg.start = ui_v_reg.start;
+     it_v_reg.end = bi_frame_vptr + BIT(PAGE_BITS);
+ 
++
++    keystone_map_kernel_window(keystone_dram_base, keystone_dram_base + keystone_dram_size);
+     map_kernel_window();
+ 
+     /* initialise the CPU */
+     init_cpu();
+ 
+     /* initialize the platform */
+-    init_plat(dtb_reg);
++    init_plat(keystone_dram_base, keystone_dram_size);
+ 
+     /* make the free memory available to alloc_region() */
+-    init_freemem(ui_reg, dtb_reg);
++    init_freemem(ui_reg, dtb_reg); // this does nothing actually
++
++    region_t cur_reg = ((region_t) {
++        PPTR_BASE, PPTR_BASE + keystone_dram_size
++        });
++    region_t res_reg = paddr_to_pptr_reg((p_region_t) {
++        keystone_runtime_start, keystone_free_start
++        });
++    cur_reg = insert_region_excluded(cur_reg, res_reg);
++    if(cur_reg.start < cur_reg.end)
++      assert(insert_region(cur_reg));
+ 
+     /* create the root cnode */
+     root_cnode_cap = create_root_cnode();
+@@ -378,28 +414,38 @@ try_init_kernel(
+     ksNumCPUs = 1;
+ 
+     printf("Booting all finished, dropped to user space\n");
++
++    // turning on cycle counter
++    unsigned long v = 0x7;
++    asm volatile ("csrw scounteren, %0" : :"rK" (v));
++
+     return true;
+ }
+ 
+ BOOT_CODE VISIBLE void
+ init_kernel(
+-    paddr_t ui_p_reg_start,
+-    paddr_t ui_p_reg_end,
+-    sword_t pv_offset,
+-    vptr_t  v_entry,
+-    word_t hartid,
+-    paddr_t dtb_output_p
++    uint64_t dummy,
++    paddr_t keystone_dram_base,
++    uint64_t keystone_dram_size,
++    paddr_t keystone_runtime_start,
++    paddr_t keystone_user_start,
++    paddr_t keystone_free_start,
++    vptr_t  keystone_utm_ptr,
++    uint64_t  keystone_utm_size
+ )
+ {
+-    pptr_t dtb_output = (pptr_t)paddr_to_pptr(dtb_output_p);
+-
+-    bool_t result = try_init_kernel(ui_p_reg_start,
+-                                    ui_p_reg_end,
+-                                    dtb_output_p,
+-                                    dtb_output_p + fdt_size((void*)dtb_output),
+-                                    pv_offset,
+-                                    v_entry
+-                                   );
++    //pptr_t dtb_output = (pptr_t)paddr_to_pptr(dtb_output_p);
++
++    //(void) dtb_output_p;
++
++    bool_t result = try_init_kernel(dummy,
++                                    keystone_dram_base,
++                                    keystone_dram_size,
++                                    keystone_runtime_start,
++                                    keystone_user_start,
++                                    keystone_free_start,
++                                    keystone_utm_ptr,
++                                    keystone_utm_size);
+ 
+     if (!result) {
+         fail ("Kernel init failed for some reason :(");
+diff --git src/arch/riscv/kernel/vspace.c src/arch/riscv/kernel/vspace.c
+index 6e467543..6d576d8c 100644
+--- src/arch/riscv/kernel/vspace.c
++++ src/arch/riscv/kernel/vspace.c
+@@ -99,48 +99,82 @@ static pte_t pte_next(word_t phys_addr, bool_t is_leaf)
+ 
+ /* ==================== BOOT CODE STARTS HERE ==================== */
+ 
++/* we need to map PPTR_BASE --> freemem */
+ BOOT_CODE VISIBLE void
++keystone_map_kernel_window(word_t dram_start, word_t dram_end)
++{
++    /*Keystone: we map PPTR_BASE to free memory */
++    word_t pptr = PPTR_BASE; /* 0xffffffc000000000 */
++    word_t paddr = dram_start;
++//    while (pptr < PPTR_BASE + RISCV_GET_LVL_PGSIZE(2)) { /* 0xffffffc000000000 - 0xffffffff80000000 */
++        assert(IS_ALIGNED(pptr, RISCV_GET_LVL_PGSIZE_BITS(2)));
++        assert(IS_ALIGNED(paddr, RISCV_GET_LVL_PGSIZE_BITS(2)));
++
++        /* MAP VA 0xffffffc000000000 --> PA 0x80000000 : up to kernel base */
++        kernel_root_pageTable[RISCV_GET_PT_INDEX(pptr, 1)] =
++          pte_next(kpptr_to_paddr(kernel_root_level2_pageTable), false);
++        while (pptr < PPTR_BASE + (dram_end - dram_start)) {
++          //printf("pptr:0x%llx --> paddr:0x%llx\n", (unsigned long long) pptr, (unsigned long long) paddr);
++          kernel_root_level2_pageTable[RISCV_GET_PT_INDEX(pptr,2)] = pte_next(paddr, true);
++          pptr += RISCV_GET_LVL_PGSIZE(2);
++          paddr += RISCV_GET_LVL_PGSIZE(2);
++        }
++   // }
++      //   kernel_root_pageTable[RISCV_GET_PT_INDEX(pptr, 1)] = pte_next(paddr, true);
++    /*
++        pptr += RISCV_GET_LVL_PGSIZE(1);
++        paddr += RISCV_GET_LVL_PGSIZE(1);
++    }*/
++}
++
++  BOOT_CODE VISIBLE void
+ map_kernel_window(void)
+ {
+     /* mapping of kernelBase (virtual address) to kernel's physBase  */
+     assert(CONFIG_PT_LEVELS > 1 && CONFIG_PT_LEVELS <= 4);
+ 
+     /* kernel window starts at PPTR_BASE */
+-    word_t pptr = PPTR_BASE;
++    word_t pptr = PPTR_BASE; /* 0xffffffc000000000 */
+ 
+     /* first we map in memory from PADDR_BASE */
+-    word_t paddr = PADDR_BASE;
+-    while (pptr < KERNEL_BASE) {
+-        assert(IS_ALIGNED(pptr, RISCV_GET_LVL_PGSIZE_BITS(1)));
++    word_t paddr = PADDR_BASE; /* 0x80000000UL */
++    //while (pptr < KERNEL_BASE) { /* 0xffffffc000000000 - 0xffffffff80000000 */
++    /*    assert(IS_ALIGNED(pptr, RISCV_GET_LVL_PGSIZE_BITS(1)));
+         assert(IS_ALIGNED(paddr, RISCV_GET_LVL_PGSIZE_BITS(1)));
+-
+-        kernel_root_pageTable[RISCV_GET_PT_INDEX(pptr, 1)] = pte_next(paddr, true);
+-
++    */
++        /* MAP VA 0xffffffc000000000 --> PA 0x80000000 : up to kernel base */
++     //   kernel_root_pageTable[RISCV_GET_PT_INDEX(pptr, 1)] = pte_next(paddr, true);
++    /*
+         pptr += RISCV_GET_LVL_PGSIZE(1);
+         paddr += RISCV_GET_LVL_PGSIZE(1);
+-    }
++    }*/
++
+     /* now we should be mapping the 1GiB kernel base, starting again from PADDR_LOAD */
+-    assert(pptr == KERNEL_BASE);
+-    paddr = PADDR_LOAD;
+-
+-#ifndef RISCV_KERNEL_WINDOW_LEVEL2_PT
+-    kernel_root_pageTable[RISCV_GET_PT_INDEX(pptr, 1)] = pte_next(paddr, true);
+-    pptr += RISCV_GET_LVL_PGSIZE(1);
+-    paddr += RISCV_GET_LVL_PGSIZE(1);
+-#else
+-    word_t index = 0;
++    pptr = KERNEL_BASE;
++    //assert(pptr == KERNEL_BASE);
++    paddr = PADDR_LOAD; /* PA 0xc0000000 */
++
++//#ifndef RISCV_KERNEL_WINDOW_LEVEL2_PT
++    /* MAP VA 0xffffffff80000000 --> PA 0xc0000000 */
++//    kernel_root_pageTable[RISCV_GET_PT_INDEX(pptr, 1)] = pte_next(paddr, true);
++//    pptr += RISCV_GET_LVL_PGSIZE(1);
++//    paddr += RISCV_GET_LVL_PGSIZE(1);
++//#else
+     kernel_root_pageTable[RISCV_GET_PT_INDEX(pptr, 1)] =
+         pte_next(kpptr_to_paddr(kernel_image_level2_pt), false);
+-    while (pptr < KERNEL_BASE + RISCV_GET_LVL_PGSIZE(1)) {
+-        kernel_image_level2_pt[index] = pte_next(paddr, true);
+-        index++;
+-        pptr += RISCV_GET_LVL_PGSIZE(2);
+-        paddr += RISCV_GET_LVL_PGSIZE(2);
++    kernel_image_level2_pt[RISCV_GET_PT_INDEX(pptr, 2)] =
++        pte_next(kpptr_to_paddr(kernel_image_level3_pt), false);
++
++    while (pptr < KERNEL_BASE + RISCV_GET_LVL_PGSIZE(2)) {
++        //printf("pptr:0x%llx --> paddr:0x%llx\n", (unsigned long long) pptr, (unsigned long long) paddr);
++        kernel_image_level3_pt[RISCV_GET_PT_INDEX(pptr, 3)] = pte_next(paddr, true);
++        pptr += RISCV_GET_LVL_PGSIZE(3);
++        paddr += RISCV_GET_LVL_PGSIZE(3);
+     }
+-#endif
++//#endif
+ 
+     /* There should be 1GiB free where we will put device mapping some day */
+-    assert(pptr == UINTPTR_MAX - RISCV_GET_LVL_PGSIZE(1) + 1);
++    //assert(pptr == UINTPTR_MAX - RISCV_GET_LVL_PGSIZE(1) + 1);
+ }
+ 
+ BOOT_CODE void
+@@ -181,6 +215,12 @@ map_it_frame_cap(cap_t vspace_cap, cap_t frame_cap)
+     pte_t* frame_pptr   = PTE_PTR(pptr_of_cap(frame_cap));
+     vptr_t frame_vptr = cap_frame_cap_get_capFMappedAddress(frame_cap);
+ 
++    /* there's a weird bug in SeL4 that adds some bits to
++     * the user VA. for QEMU, it adds 0x100000000, for HiFive, it adds 0x200000000
++     * I couldn't figure out why it is doing that, so
++     * let's just hack it for now. */
++    if(frame_vptr & 0x700000000)
++      frame_vptr &= 0xffffffff;
+     /* We deal with a frame as 4KiB */
+     lookupPTSlot_ret_t lu_ret = lookupPTSlot(lvl1pt, frame_vptr);
+     assert(lu_ret.ptBitsLeft == seL4_PageBits);
+diff --git src/arch/riscv/model/statedata.c src/arch/riscv/model/statedata.c
+index c68f4411..daf361da 100644
+--- src/arch/riscv/model/statedata.c
++++ src/arch/riscv/model/statedata.c
+@@ -31,6 +31,8 @@ asid_pool_t *riscvKSASIDTable[BIT(asidHighBits)];
+ 
+ /* Kernel Page Tables */
+ pte_t kernel_root_pageTable[BIT(PT_INDEX_BITS)] ALIGN_BSS(BIT(seL4_PageTableBits));
++pte_t kernel_root_level2_pageTable[BIT(PT_INDEX_BITS)] ALIGN_BSS(BIT(seL4_PageTableBits));
+ #ifdef RISCV_KERNEL_WINDOW_LEVEL2_PT
+ pte_t kernel_image_level2_pt[BIT(PT_INDEX_BITS)] ALIGN_BSS(BIT(seL4_PageTableBits));
++pte_t kernel_image_level3_pt[BIT(PT_INDEX_BITS)] ALIGN_BSS(BIT(seL4_PageTableBits));
+ #endif
+diff --git src/plat/spike/machine/fdt.c src/plat/spike/machine/fdt.c
+index 0b547a36..89c1ae5e 100644
+--- src/plat/spike/machine/fdt.c
++++ src/plat/spike/machine/fdt.c
+@@ -191,6 +191,16 @@ static uint32_t *fdt_scan_helper(
+     }
+ }
+ 
++void keystoneFDT(uint64_t memstart, uint64_t memsize)
++{
++  if (!add_avail_p_reg((p_region_t){
++        memstart, memstart + memsize
++        })) {
++    printf("Failed to add physical memory region %llu-%llu\n", (unsigned long long)memstart,
++        (unsigned long long)(memstart + memsize));
++  }
++}
++
+ void parseFDT(void *fdt)
+ {
+     struct fdt_header *header = (struct fdt_header *)fdt;
+diff --git src/plat/spike/machine/hardware.c src/plat/spike/machine/hardware.c
+index eb6da7ea..ae39c0b4 100644
+--- src/plat/spike/machine/hardware.c
++++ src/plat/spike/machine/hardware.c
+@@ -169,6 +169,7 @@ resetTimer(void)
+     // repeatedly try and set the timer in a loop as otherwise there is a race and we
+     // may set a timeout in the past, resulting in it never getting triggered
+     do {
++        sbi_stop_enclave(0);
+         target = get_cycles() + RESET_CYCLES;
+         sbi_set_timer(target);
+     } while (get_cycles() > target);
+@@ -180,7 +181,7 @@ resetTimer(void)
+ BOOT_CODE void
+ initTimer(void)
+ {
+-    sbi_set_timer(get_cycles() + RESET_CYCLES);
++  sbi_set_timer(get_cycles() + RESET_CYCLES*10);
+ }
+ 
+ void plat_cleanL2Range(paddr_t start, paddr_t end)
